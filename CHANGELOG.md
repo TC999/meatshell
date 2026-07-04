@@ -3,6 +3,29 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（English first, 中文在后）.
 
+## [0.5.4] - 2026-07-04
+
+### 新增 / Added
+
+- **SSH 跳板机（堡垒机）支持 (#211)。** 会话可指定另一个已保存的 SSH 会话作为跳板机（类似 OpenSSH 的 ProxyJump）：先连上跳板并认证，在其上开一条 direct-tcpip 通道到目标机，再完成目标机的 SSH 握手。终端与 SFTP 两条连接都经跳板走，跳板连接在整个会话期间保活、会话关闭时一并断开。跳板复用被引用会话自身的主机/账号/密钥/keyboard-interactive 认证，未存凭据时沿用原有登录弹窗；自动忽略指向自己或已删除会话的无效引用；当前仅支持单级跳板。会话对话框「高级」区（仅 SSH）新增「跳板机（可选）」下拉。
+
+### 修复 / Fixed
+
+- **修复多会话大量输出导致界面卡死 (#209)。** 将 VT100 解析移出 UI 线程、按约 30fps 节流渲染、合并输出块并改用按标签页独立的缓冲锁，某台服务器解压大量文件时不再拖垮其它会话与整个界面。
+- **修复欢迎页会话面板首次建会话时高度跳变 (#214)。** 快速连接卡片现在始终撑满剩余高度、空状态占位区随之拉伸，建会话前后面板高度保持一致、不再跳动。
+
+---
+
+### Added
+
+- **SSH jump host (bastion) support (#211).** A session can tunnel through another saved SSH session as a jump host (like OpenSSH's ProxyJump): connect and authenticate to the jump, open a direct-tcpip channel to the target, and run the target's SSH handshake over it. Both the shell and SFTP connections go through the jump, which is kept alive for the whole session and torn down when it closes. The jump reuses the referenced session's own host/user/key/keyboard-interactive auth, falling back to the usual login prompt when no credentials are stored; dangling or self references are ignored; single hop only for now. The session dialog's Advanced section (SSH only) gains an optional "Jump host" dropdown.
+
+### Fixed
+
+- **Fix UI freeze on heavy output across multiple sessions (#209).** VT100 parsing moved off the UI thread, rendering throttled to ~30fps, output chunks coalesced, and per-tab buffer locks adopted, so unzipping many files on one server no longer stalls other sessions or the whole UI.
+- **Stop the welcome session panel height jump on the first session (#214).** The quick-connect card now always fills the remaining height and the empty-state placeholder stretches to match, keeping the panel height stable before and after adding a session.
+
+
 ## [0.5.3] - 2026-07-04
 
 ### 新增 / Added
