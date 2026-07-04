@@ -388,6 +388,11 @@ pub struct Session {
     /// "http://user:pass@host:8080". Empty = use $ALL_PROXY, else direct.
     #[serde(default)]
     pub proxy: String,
+    /// Optional SSH jump host (bastion): the id of another saved SSH session to
+    /// tunnel this connection through, like OpenSSH's ProxyJump. Empty = direct.
+    /// Single hop only; the jump session supplies its own host/user/auth (#211).
+    #[serde(default)]
+    pub jump_session_id: String,
     #[serde(default)]
     pub last_used: Option<String>,
     /// Optional folder/group name to organize sessions in the list (#41).
@@ -468,6 +473,7 @@ impl Session {
             private_key_path: String::new(),
             private_key_inline: Secret::default(),
             proxy: String::new(),
+            jump_session_id: String::new(),
             last_used: None,
             group: String::new(),
             kind: SessionKind::Ssh,

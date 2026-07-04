@@ -35,6 +35,9 @@ export struct SessionDraft {
     disable-shell-integration: bool,
     // Free-form note (B站 suggestion).
     note: string,
+    // Id of another saved SSH session to use as a jump host / bastion, or "" for
+    // a direct connection (#211).
+    jump-session-id: string,
 }
 
 // A single segment in a segmented selector (auth toggle, baud presets, …).
@@ -195,6 +198,96 @@ component GroupCombo inherits VerticalLayout {
     }
 }
 
+// Read-only dropdown picking an SSH jump host from a fixed list of saved
+// sessions (#211). Index-based: `choices[0]` is the "no jump host" entry, and
+// `selected-index` maps into the parallel `ids` list held by the caller.
+component JumpCombo inherits VerticalLayout {
+    in property <string> label;
+    in property <[string]> choices;      // display labels; index 0 = "no jump host"
+    in-out property <int> selected-index: 0;
+    spacing: 4px;
+
+    Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-size: Theme.fs-sm;
+    }
+
+    Rectangle {
+        height: 32px;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: jump-ta.has-hover ? Theme.accent : Theme.border-subtle;
+        background: Theme.bg-root;
+
+        jump-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { jump-popup.show(); }
+        }
+
+        Text {
+            x: 10px;
+            width: parent.width - 44px;
+            height: parent.height;
+            text: (root.selected-index >= 0 && root.selected-index < root.choices.length)
+                ? root.choices[root.selected-index] : "";
+            color: root.selected-index > 0 ? Theme.text-primary : Theme.text-muted;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        Rectangle {
+            x: parent.width - 36px;
+            width: 28px;
+            height: 28px;
+            border-radius: Theme.radius-sm;
+            background: jump-ta.has-hover ? Theme.bg-hover : transparent;
+            Text {
+                text: "▼";
+                color: Theme.text-secondary;
+                font-size: Theme.fs-xs;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        jump-popup := PopupWindow {
+            x: 0;
+            y: parent.height + 3px;
+            width: parent.width;
+            Rectangle {
+                background: Theme.bg-elevated;
+                border-radius: Theme.radius-sm;
+                border-width: 1px;
+                border-color: Theme.border-subtle;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 1px;
+                    for c[idx] in root.choices : Rectangle {
+                        height: 28px;
+                        border-radius: Theme.radius-sm;
+                        background: c-ta.has-hover ? Theme.bg-hover : transparent;
+                        c-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.selected-index = idx; jump-popup.close(); }
+                        }
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            text: c;
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-md;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Modal dialog for creating / editing a session (SSH / Serial / Telnet).
 // The dialog is purely presentational — it stores values in mutable
 // properties and emits `submit` / `cancel` callbacks up to the main window.
@@ -218,6 +311,11 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-proxy-hostport;
     in-out property <string> draft-group;
     in property <[string]> session-groups;   // existing groups for the dropdown (#179)
+    // SSH jump host picker (#211): parallel label/id lists (index 0 = "none")
+    // plus the selected index. The id is resolved on submit via `jump-ids`.
+    in property <[string]> jump-choices;
+    in property <[string]> jump-ids;
+    in-out property <int> draft-jump-index: 0;
     in-out property <string> draft-serial-port;
     in-out property <string> draft-baud: "115200";
     in-out property <string> draft-data-bits: "8";
@@ -633,6 +731,21 @@ export component SessionDialog inherits Rectangle {
                 }
             }
 
+            // ── SSH jump host / bastion (SSH only) (#211) ───────────────────
+            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 4px;
+                JumpCombo {
+                    label: @tr("Jump host (optional)");
+                    choices: root.jump-choices;
+                    selected-index <=> root.draft-jump-index;
+                }
+                Text {
+                    text: @tr("Tunnel this connection through another saved SSH session.");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+
             // ── Port forwarding / tunnels (SSH only) (#56) ──────────────────
             if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
                 spacing: 6px;
@@ -802,6 +915,8 @@ export component SessionDialog inherits Rectangle {
                             flow-control: root.draft-flow,
                             disable-shell-integration: root.draft-disable-shell-integration,
                             note: root.draft-note,
+                            jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)
+                                ? root.jump-ids[root.draft-jump-index] : "",
                         });
                     }
                 }

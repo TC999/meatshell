@@ -396,6 +396,12 @@ msgstr "代理地址"
 msgid "Format: host:port  (with auth: user:pass@host:port)"
 msgstr "格式：host:port（带认证：user:pass@host:port）"
 
+msgid "Jump host (optional)"
+msgstr "跳板机（可选）"
+
+msgid "Tunnel this connection through another saved SSH session."
+msgstr "通过另一个已保存的 SSH 会话作为跳板来连接。"
+
 msgid "Connection type"
 msgstr "连接类型"
 

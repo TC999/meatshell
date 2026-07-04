@@ -1553,6 +1553,7 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            store: store.clone(),
         },
     );
 
@@ -2044,6 +2045,46 @@ fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
     )))
 }
 
+/// Build the jump-host picker's parallel label/id lists for the session dialog
+/// (#211). Index 0 is always the "no jump host" entry (empty id); the rest are
+/// the saved SSH sessions except `exclude_id` (a session can't jump through
+/// itself). Returns `(labels, ids, selected_index)` where `selected_index`
+/// points at `current_jump_id` (0 if unset / dangling).
+fn jump_candidates(
+    store: &ConfigStore,
+    exclude_id: &str,
+    current_jump_id: &str,
+) -> (ModelRc<SharedString>, ModelRc<SharedString>, i32) {
+    let mut labels: Vec<SharedString> =
+        vec![t("无（直接连接）", "None (direct)").into()];
+    let mut ids: Vec<SharedString> = vec!["".into()];
+    let mut selected: i32 = 0;
+    for s in store.sessions() {
+        if s.kind != SessionKind::Ssh || s.id == exclude_id {
+            continue;
+        }
+        let label = if s.name.trim().is_empty() {
+            if s.user.trim().is_empty() {
+                s.host.clone()
+            } else {
+                format!("{}@{}", s.user, s.host)
+            }
+        } else {
+            format!("{} ({}@{})", s.name, s.user, s.host)
+        };
+        if s.id == current_jump_id {
+            selected = ids.len() as i32;
+        }
+        labels.push(label.into());
+        ids.push(s.id.clone().into());
+    }
+    (
+        ModelRc::from(Rc::new(VecModel::from(labels))),
+        ModelRc::from(Rc::new(VecModel::from(ids))),
+        selected,
+    )
+}
+
 fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     // Group sessions by their `group` (named groups alphabetically, ungrouped
     // last), then by name within each group, and tag the first row of every
@@ -2171,6 +2212,11 @@ fn wire_session_callbacks(
             w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&[]));
             let empty = Session::new_empty();
+            let (jump_labels, jump_ids, jump_idx) =
+                jump_candidates(&store_ng.borrow(), &empty.id, "");
+            w.set_jump_choices(jump_labels);
+            w.set_jump_ids(jump_ids);
+            w.set_dialog_jump_index(jump_idx);
             w.set_dialog_id(empty.id.into());
             w.set_dialog_name("".into());
             w.set_dialog_host("".into());
@@ -2390,6 +2436,11 @@ fn wire_session_callbacks(
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
+                let (jump_labels, jump_ids, jump_idx) =
+                    jump_candidates(&store, &session.id, &session.jump_session_id);
+                w.set_jump_choices(jump_labels);
+                w.set_jump_ids(jump_ids);
+                w.set_dialog_jump_index(jump_idx);
                 w.set_dialog_group(session.group.clone().into());
                 w.set_dialog_kind(session.kind.as_str().into());
                 w.set_dialog_serial_port(session.serial_port.clone().into());
@@ -2649,6 +2700,7 @@ fn wire_session_callbacks(
                 forwards: edit_forwards.borrow().clone(),
                 disable_shell_integration: draft.disable_shell_integration,
                 note: draft.note.to_string(),
+                jump_session_id: draft.jump_session_id.to_string(),
             };
             {
                 let mut s = store.borrow_mut();
@@ -2907,6 +2959,7 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                store: store.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -2962,6 +3015,21 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// Config store, so a session's jump host (#211) can be resolved by id at
+    /// connect time on the UI thread.
+    store: Rc<RefCell<ConfigStore>>,
+}
+
+/// Resolve a session's configured SSH jump host to the saved session it points
+/// at, ignoring a missing / dangling / self reference (#211).
+fn resolve_jump(store: &Rc<RefCell<ConfigStore>>, session: &Session) -> Option<Session> {
+    if session.kind != SessionKind::Ssh || session.jump_session_id.trim().is_empty() {
+        return None;
+    }
+    if session.jump_session_id == session.id {
+        return None;
+    }
+    store.borrow().get(&session.jump_session_id).cloned()
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -2970,11 +3038,15 @@ struct ConnectCtx {
 fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     let has_sftp = session.kind == SessionKind::Ssh;
     let (initial_cols, initial_rows) = *ctx.last_term_size.lock().unwrap();
+    // Resolve the optional SSH jump host now (on the UI thread, where the store
+    // lives) so the owned Session can be handed to the worker threads (#211).
+    let jump = resolve_jump(&ctx.store, &session);
     let (handle, rx) = match session.kind {
         SessionKind::Ssh => spawn_session(
             ctx.runtime.handle(),
             tab_id.to_string(),
             session.clone(),
+            jump.clone(),
             initial_cols,
             initial_rows,
         ),
@@ -2996,7 +3068,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     // Separate SFTP connection for the same session (SSH only).
     let sftp_evt_tx = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, sftp_tx);
+        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, jump, sftp_tx);
         ctx.sftp_handles
             .lock()
             .unwrap()

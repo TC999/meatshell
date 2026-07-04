@@ -396,6 +396,12 @@ msgstr "Proxy address"
 msgid "Format: host:port  (with auth: user:pass@host:port)"
 msgstr "Format: host:port  (with auth: user:pass@host:port)"
 
+msgid "Jump host (optional)"
+msgstr "Jump host (optional)"
+
+msgid "Tunnel this connection through another saved SSH session."
+msgstr "Tunnel this connection through another saved SSH session."
+
 msgid "Connection type"
 msgstr "Connection type"
 
