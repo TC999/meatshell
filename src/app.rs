@@ -7,8 +7,9 @@
 //!   * Route Slint callbacks to the right domain module.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-terminal state: vt100 parser drives all rendering for both normal
@@ -59,6 +60,10 @@ struct TermBuffer {
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
 const RAW_CAP: usize = 2 * 1024 * 1024;
 
+/// Max bytes merged into one Output event before starting a fresh chunk (#209).
+/// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
+const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
+
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
 enum CsiState {
@@ -70,7 +75,50 @@ enum CsiState {
     Csi,
 }
 
-type TermBuffers = Arc<Mutex<HashMap<String, TermBuffer>>>;
+/// Max UI renders per second for a tab under sustained output (#209).
+const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// Per-tab terminal buffer — each tab has its own lock so a burst of output on
+/// one session (e.g. `unzip` listing thousands of files) doesn't block keyboard
+/// input on another (#209).
+type TermBufferHandle = Arc<Mutex<TermBuffer>>;
+type TermBuffers = Arc<Mutex<HashMap<String, TermBufferHandle>>>;
+
+/// Coalesces render requests so a firehose of output schedules at most one UI
+/// flush at a time per tab, throttled to ~30 fps (#209).
+struct TabRenderGate {
+    scheduled: AtomicBool,
+    pending: AtomicBool,
+    last_render: Mutex<std::time::Instant>,
+}
+
+impl TabRenderGate {
+    fn new() -> Self {
+        Self {
+            scheduled: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            last_render: Mutex::new(std::time::Instant::now() - RENDER_MIN_INTERVAL),
+        }
+    }
+}
+
+type RenderGates = Arc<Mutex<HashMap<String, Arc<TabRenderGate>>>>;
+
+fn term_buf(bufs: &TermBuffers, tab_id: &str) -> Option<TermBufferHandle> {
+    bufs.lock().unwrap().get(tab_id).cloned()
+}
+
+fn with_term_buf<R>(bufs: &TermBuffers, tab_id: &str, f: impl FnOnce(&mut TermBuffer) -> R) -> Option<R> {
+    let h = term_buf(bufs, tab_id)?;
+    let mut guard = h.lock().unwrap();
+    Some(f(&mut guard))
+}
+
+fn ingest_terminal_output(bufs: &TermBuffers, tab_id: &str, chunk: &[u8]) {
+    if let Some(h) = term_buf(bufs, tab_id) {
+        h.lock().unwrap().ingest(chunk);
+    }
+}
 
 use anyhow::{Context, Result};
 use i_slint_backend_winit::WinitWindowAccessor;
@@ -124,6 +172,111 @@ type LocalSnap = Arc<Mutex<SystemSnapshot>>;
 
 // Slint generates types into this scope.
 slint::include_modules!();
+
+/// Tab ids currently shown in a pane (`term.id == pane.active-id` in Slint).
+fn visible_tab_ids(win: &AppWindow) -> HashSet<String> {
+    use slint::Model as _;
+    let mut out = HashSet::new();
+    let panes = win.get_panes();
+    if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
+        for i in 0..pm.row_count() {
+            if let Some(pane) = pm.row_data(i) {
+                out.insert(pane.active_id.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn request_tab_render(
+    weak: slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+    gate.pending.store(true, Ordering::Release);
+    if gate.scheduled.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let weak2 = weak.clone();
+    let tid = tab_id.to_string();
+    let bufs2 = bufs.clone();
+    let gates2 = gates.clone();
+    // Always bounce through the event loop from pump / worker threads.
+    // Never call invoke_from_event_loop from inside a UI callback — that
+    // deadlocks Slint (opening a second tab then froze the whole app).
+    let _ = slint::invoke_from_event_loop(move || {
+        run_coalesced_tab_render(&weak2, &tid, &bufs2, &gates2);
+    });
+}
+
+/// UI-thread entry: honour the throttle, then render. Timer must be created
+/// here — not on pump threads (#209).
+fn run_coalesced_tab_render(
+    weak: &slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+
+    let delay = {
+        let last = *gate.last_render.lock().unwrap();
+        RENDER_MIN_INTERVAL.saturating_sub(last.elapsed())
+    };
+
+    let weak2 = weak.clone();
+    let tid = tab_id.to_string();
+    let bufs2 = bufs.clone();
+    let gates2 = gates.clone();
+
+    if delay.is_zero() {
+        do_tab_render_flush(&weak2, &tid, &bufs2, &gates2);
+    } else {
+        slint::Timer::single_shot(delay, move || {
+            do_tab_render_flush(&weak2, &tid, &bufs2, &gates2);
+        });
+    }
+}
+
+/// UI-thread only: push the vt100 screen into Slint, then reschedule if more
+/// output arrived while we were rendering (#209).
+fn do_tab_render_flush(
+    weak: &slint::Weak<AppWindow>,
+    tab_id: &str,
+    bufs: &TermBuffers,
+    gates: &RenderGates,
+) {
+    let gate = {
+        let m = gates.lock().unwrap();
+        m.get(tab_id).cloned()
+    };
+    let Some(gate) = gate else { return };
+    gate.scheduled.store(false, Ordering::Release);
+
+    if let Some(win) = weak.upgrade() {
+        if visible_tab_ids(&win).contains(tab_id) {
+            rebuild_tab_display(&win, bufs, tab_id);
+            *gate.last_render.lock().unwrap() = std::time::Instant::now();
+        }
+    }
+
+    if gate.pending.swap(false, Ordering::AcqRel) {
+        if !gate.scheduled.swap(true, Ordering::AcqRel) {
+            run_coalesced_tab_render(weak, tab_id, bufs, gates);
+        }
+    }
+}
 
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
@@ -317,6 +470,7 @@ pub fn run() -> Result<()> {
     // Per-tab vt100 parsers + history logs (Arc<Mutex> so they can be cloned
     // into the thread that pumps session events into invoke_from_event_loop).
     let bufs: TermBuffers = Arc::new(Mutex::new(HashMap::new()));
+    let render_gates: RenderGates = Arc::new(Mutex::new(HashMap::new()));
 
     // Last-known terminal pixel dimensions, updated by every terminal-resize
     // callback.  Shared so on_connect_session can pass a sensible initial PTY
@@ -1025,6 +1179,7 @@ pub fn run() -> Result<()> {
         splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
+        render_gates.clone(),
         runtime.clone(),
         last_term_size.clone(),
         sftp_handles.clone(),
@@ -1374,6 +1529,7 @@ pub fn run() -> Result<()> {
         splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
+        render_gates.clone(),
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
     );
@@ -1391,6 +1547,7 @@ pub fn run() -> Result<()> {
             sftp_handles: sftp_handles.clone(),
             sftp_last_cwd: sftp_last_cwd.clone(),
             bufs: bufs.clone(),
+            render_gates: render_gates.clone(),
             tab_statuses: tab_statuses.clone(),
             local_snap: local_snap.clone(),
             local_net_hist: local_net_hist.clone(),
@@ -1988,6 +2145,7 @@ fn wire_session_callbacks(
     splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     runtime: Arc<Runtime>,
     last_term_size: Arc<Mutex<(u32, u32)>>,
     sftp_handles: SftpHandles,
@@ -2599,6 +2757,7 @@ fn wire_session_callbacks(
         let content_size = content_size.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let render_gates = render_gates.clone();
         let runtime = runtime.clone();
         let last_term_size = last_term_size.clone();
         let sftp_handles = sftp_handles.clone();
@@ -2699,7 +2858,7 @@ fn wire_session_callbacks(
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
-                TermBuffer {
+                Arc::new(Mutex::new(TermBuffer {
                     parser: vt100::Parser::new(24, 80, 5000),
                     find_query: String::new(),
                     is_dark: is_dark_now,
@@ -2711,8 +2870,12 @@ fn wire_session_callbacks(
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
                     raw: std::collections::VecDeque::new(),
-                },
+                })),
             );
+            render_gates
+                .lock()
+                .unwrap()
+                .insert(tab_id.clone(), Arc::new(TabRenderGate::new()));
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
             // Add the new tab to the focused pane and re-flatten (this also sets
@@ -2738,6 +2901,7 @@ fn wire_session_callbacks(
                 sftp_handles: sftp_handles.clone(),
                 sftp_last_cwd: sftp_last_cwd.clone(),
                 bufs: bufs.clone(),
+                render_gates: render_gates.clone(),
                 tab_statuses: tab_statuses.clone(),
                 local_snap: local_snap.clone(),
                 local_net_hist: local_net_hist.clone(),
@@ -2791,6 +2955,7 @@ struct ConnectCtx {
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     tab_statuses: TabStatuses,
     local_snap: LocalSnap,
     local_net_hist: NetHist,
@@ -2853,6 +3018,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_pump = ctx.local_snap.clone();
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
+        let render_gates_pump = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -2925,9 +3091,15 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             // Merge with the immediately preceding Output so the
                             // whole run is one vt100 ingest + one render. Only
                             // *adjacent* chunks merge, so byte order (and any
-                            // interleaved event) is preserved exactly.
+                            // interleaved event) is preserved exactly. Cap the
+                            // merged size so one batch can't monopolize the UI
+                            // thread for hundreds of ms (#209).
                             if let Some(SessionEvent::Output(prev)) = ui_batch.last_mut() {
-                                prev.push_str(&chunk);
+                                if prev.len() + chunk.len() <= OUTPUT_MERGE_BYTE_CAP {
+                                    prev.push_str(&chunk);
+                                } else {
+                                    ui_batch.push(SessionEvent::Output(chunk));
+                                }
                             } else {
                                 ui_batch.push(SessionEvent::Output(chunk));
                             }
@@ -2939,17 +3111,49 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                     continue;
                 }
 
+                // Ingest terminal output on this pump thread (not the UI thread)
+                // so a firehose can't block keyboard input or repaints (#209).
+                let mut had_output = false;
+                let mut ui_only: Vec<SessionEvent> = Vec::with_capacity(ui_batch.len());
+                for evt in ui_batch {
+                    match evt {
+                        SessionEvent::Output(chunk) => {
+                            ingest_terminal_output(
+                                &bufs_thread,
+                                &tab_id_pump,
+                                chunk.as_bytes(),
+                            );
+                            had_output = true;
+                        }
+                        other => ui_only.push(other),
+                    }
+                }
+
+                if had_output {
+                    request_tab_render(
+                        weak_inner.clone(),
+                        &tab_id_pump,
+                        &bufs_thread,
+                        &render_gates_pump,
+                    );
+                }
+
+                if ui_only.is_empty() {
+                    continue;
+                }
+
                 let weak_evt = weak_inner.clone();
                 let tid = tab_id_pump.clone();
                 let bufs_evt = bufs_thread.clone();
                 let st_evt = statuses_pump.clone();
                 let lc_evt = local_pump.clone();
                 let nh_evt = net_pump.clone();
+                let gates_evt = render_gates_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
-                        for evt in ui_batch {
+                        for evt in ui_only {
                             apply_session_event_to_window(
-                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
+                                &win, &tid, evt, &bufs_evt, &gates_evt, &st_evt, &lc_evt, &nh_evt,
                             );
                         }
                     }
@@ -2966,27 +3170,42 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let statuses_sftp = ctx.tab_statuses.clone();
         let local_sftp = ctx.local_snap.clone();
         let net_sftp = ctx.local_net_hist.clone();
+        let gates_sftp = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
+            let mut drained: Vec<SessionEvent> = Vec::new();
             loop {
                 match sftp_rx.blocking_recv() {
                     None => break,
-                    Some(sftp_evt) => {
-                        let weak_s = weak_sftp.clone();
-                        let tid = tab_id_sftp.clone();
-                        let bufs_s = bufs_sftp.clone();
-                        let st_s = statuses_sftp.clone();
-                        let lc_s = local_sftp.clone();
-                        let nh_s = net_sftp.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_s.upgrade() {
-                                apply_session_event_to_window(
-                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s,
-                                );
-                            }
-                        });
+                    Some(first) => drained.push(first),
+                }
+                const SFTP_DRAIN_CAP: usize = 256;
+                while drained.len() < SFTP_DRAIN_CAP {
+                    match sftp_rx.try_recv() {
+                        Ok(evt) => drained.push(evt),
+                        Err(_) => break,
                     }
                 }
+                let ui_batch: Vec<SessionEvent> = drained.drain(..).collect();
+                if ui_batch.is_empty() {
+                    continue;
+                }
+                let weak_s = weak_sftp.clone();
+                let tid = tab_id_sftp.clone();
+                let bufs_s = bufs_sftp.clone();
+                let st_s = statuses_sftp.clone();
+                let lc_s = local_sftp.clone();
+                let nh_s = net_sftp.clone();
+                let gates_s = gates_sftp.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = weak_s.upgrade() {
+                        for sftp_evt in ui_batch {
+                            apply_session_event_to_window(
+                                &win, &tid, sftp_evt, &bufs_s, &gates_s, &st_s, &lc_s, &nh_s,
+                            );
+                        }
+                    }
+                });
             }
         });
     }
@@ -3415,7 +3634,8 @@ fn apply_terminal_resize(
     if let Some(handle) = handles.borrow().get(tab_id) {
         handle.resize(cols, rows);
     }
-    if let Some(buf) = bufs.lock().unwrap().get_mut(tab_id) {
+    if let Some(h) = term_buf(bufs, tab_id) {
+        let mut buf = h.lock().unwrap();
         let (old_rows, old_cols) = buf.parser.screen().size();
         let (new_rows, new_cols) = (rows as u16, cols as u16);
         if (new_rows, new_cols) != (old_rows, old_cols) {
@@ -3439,18 +3659,16 @@ fn apply_terminal_resize(
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
 fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
-    let data = {
-        let mut map = bufs.lock().unwrap();
-        let Some(buf) = map.get_mut(tab_id) else {
-            return;
-        };
+    let data = with_term_buf(bufs, tab_id, |buf| {
         let cols = buf.parser.screen().size().1;
         let b = buf.render(); // also refreshes buf.displayed_text
         let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
         let sel = buf.selection_rects_visible(cols);
         (b, matches, sel)
+    });
+    let Some((b, matches, sel)) = data else {
+        return;
     };
-    let (b, matches, sel) = data;
     let spans = ModelRc::from(Rc::new(VecModel::from(b.spans)));
     let fm = ModelRc::from(Rc::new(VecModel::from(matches)));
     let sm = ModelRc::from(Rc::new(VecModel::from(sel)));
@@ -3467,6 +3685,7 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         row.scroll_max = smax;
         row.scroll_offset = soff;
     });
+    win.window().request_redraw();
 }
 
 /// Resolve the user's saved theme preference to a dark/light bool (mirrors the
@@ -3491,9 +3710,9 @@ fn theme_pref_is_dark(store: &ConfigStore) -> bool {
 fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
     window.set_dark_mode(dark);
     {
-        let mut map = bufs.lock().unwrap();
-        for buf in map.values_mut() {
-            buf.is_dark = dark;
+        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
+        for h in handles {
+            h.lock().unwrap().is_dark = dark;
         }
     }
     let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
@@ -3698,6 +3917,7 @@ fn apply_session_event_to_window(
     tab_id: &str,
     event: SessionEvent,
     bufs: &TermBuffers,
+    gates: &RenderGates,
     statuses: &TabStatuses,
     local: &LocalSnap,
     local_net_hist: &NetHist,
@@ -3766,48 +3986,10 @@ fn apply_session_event_to_window(
             update_terminal(&|t| t.status = status.clone().into());
         }
         SessionEvent::Output(chunk) => {
-            // Feed raw bytes into the vt100 parser. vt100 correctly handles
-            // cursor movement, \r + line-redraw (readline), \x1b[K (erase to
-            // EOL), alternate-screen switching, and all VT100/xterm sequences.
-            // We then split the rendered screen at cursor_position() so Slint
-            // can insert the blinking "█" at the exact cursor cell.
-            let built = {
-                let mut map = bufs.lock().unwrap();
-                if let Some(buf) = map.get_mut(tab_id) {
-                    // Capture scrolled-off lines into history, then render the
-                    // current view (live or scrolled-back).
-                    buf.ingest(chunk.as_bytes());
-                    let cols = buf.parser.screen().size().1;
-                    let b = buf.render(); // refreshes buf.displayed_text
-                    let matches = compute_find_matches(&buf.displayed_text, &buf.find_query);
-                    let sel = buf.selection_rects_visible(cols);
-                    Some((b, matches, sel))
-                } else {
-                    None
-                }
-            };
-            if let Some((b, matches, sel)) = built {
-                let spans_model: ModelRc<TermSpan> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(b.spans)));
-                let matches_model: ModelRc<TermMatch> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(matches)));
-                let sel_model: ModelRc<TermMatch> =
-                    ModelRc::from(std::rc::Rc::new(VecModel::from(sel)));
-                let (cur_row, cur_col, rows_used, is_alt) =
-                    (b.cursor_row, b.cursor_col, b.rows_used, b.is_alt);
-                let (smax, soff) = (b.scroll_max, b.scroll_offset);
-                update_terminal(&|t| {
-                    t.spans = spans_model.clone();
-                    t.cursor_row = cur_row;
-                    t.cursor_col = cur_col;
-                    t.rows_used = rows_used;
-                    t.is_alt_screen = is_alt;
-                    t.find_matches = matches_model.clone();
-                    t.selection = sel_model.clone();
-                    t.scroll_max = smax;
-                    t.scroll_offset = soff;
-                });
-            }
+            // Synthetic Output (disconnect hint, editor error, …) — rare, already
+            // on the UI thread. Live shell output is ingested on the pump thread.
+            ingest_terminal_output(bufs, tab_id, chunk.as_bytes());
+            run_coalesced_tab_render(&win.as_weak(), tab_id, bufs, gates);
         }
         SessionEvent::Connected => {
             update_tab(&|t| t.connected = true);
@@ -3833,6 +4015,7 @@ fn apply_session_event_to_window(
                     )
                 )),
                 bufs,
+                gates,
                 statuses,
                 local,
                 local_net_hist,
@@ -3954,6 +4137,7 @@ fn apply_session_event_to_window(
                         error
                     )),
                     bufs,
+                    gates,
                     statuses,
                     local,
                     local_net_hist,
@@ -4666,6 +4850,7 @@ fn wire_tab_callbacks(
     splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
+    render_gates: RenderGates,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
@@ -4678,6 +4863,7 @@ fn wire_tab_callbacks(
         let tabs_model = tabs_model.clone();
         let panes_model = panes_model.clone();
         let splitters_model = splitters_model.clone();
+        let bufs_tab_sel = bufs.clone();
         window.on_pane_tab_selected(move |pane_id: i32, id: SharedString| {
             let id = id.to_string();
             {
@@ -4685,7 +4871,7 @@ fn wire_tab_callbacks(
                 lay.focused = pane_id as u64;
                 if let Some(l) = lay.leaf_mut(pane_id as u64) {
                     if l.tabs.iter().any(|t| t == &id) {
-                        l.active = id;
+                        l.active = id.clone();
                     }
                 }
             }
@@ -4698,6 +4884,9 @@ fn wire_tab_callbacks(
                     &panes_model,
                     &splitters_model,
                 );
+                // Tab just became visible — render any output ingested while it
+                // was in the background (e.g. another session was unzipping).
+                rebuild_tab_display(&w, &bufs_tab_sel, &id);
             }
         });
     }
@@ -4752,6 +4941,7 @@ fn wire_tab_callbacks(
         let terminals_model = terminals_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
+        let render_gates = render_gates.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
         let panes_model = panes_model.clone();
@@ -4769,6 +4959,7 @@ fn wire_tab_callbacks(
             }
             sftp_last_cwd.lock().unwrap().remove(&id);
             bufs.lock().unwrap().remove(&id);
+            render_gates.lock().unwrap().remove(&id);
 
             // Remove from tabs + terminals models.
             let mut idx = None;
@@ -6048,8 +6239,8 @@ fn wire_key_input(
                     }
                     // Fresh screen: new parser, cleared history/selection.
                     {
-                        let mut map = ctx.bufs.lock().unwrap();
-                        if let Some(b) = map.get_mut(tab_id.as_str()) {
+                        if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
+                            let mut b = h.lock().unwrap();
                             let (rows, cols) = b.parser.screen().size();
                             b.parser = vt100::Parser::new(rows, cols, 5000);
                             b.history.clear();
@@ -6081,17 +6272,14 @@ fn wire_key_input(
             // Check whether the remote PTY switched to application cursor mode
             // (DECCKM, set by nano/vim via \x1b[?1h). In that mode the terminal
             // must send \x1bOA/B/C/D instead of \x1b[A/B/C/D.
-            let app_cursor = {
-                let mut map = bufs.lock().unwrap();
-                match map.get_mut(tab_id.as_str()) {
-                    Some(b) => {
-                        // Typing snaps the view back to the live bottom so the
-                        // user always sees what they're entering.
-                        b.view_offset = 0;
-                        b.parser.screen().application_cursor()
-                    }
-                    None => false,
-                }
+            let app_cursor = if let Some(h) = term_buf(&bufs, tab_id.as_str()) {
+                let mut b = h.lock().unwrap();
+                // Typing snaps the view back to the live bottom so the
+                // user always sees what they're entering.
+                b.view_offset = 0;
+                b.parser.screen().application_cursor()
+            } else {
+                false
             };
             // Never log the raw key string — it can be a password character
             // (#15). redact_key keeps control codes but masks printable text.
@@ -6370,22 +6558,17 @@ fn wire_key_input(
     {
         let bufs = bufs.clone();
         window.on_copy_terminal_text(move |tab_id: SharedString| {
-            let text = {
-                let map = bufs.lock().unwrap();
-                match map.get(tab_id.as_str()) {
-                    Some(buf) => {
-                        // Copy the drag-selection when there is one, else the
-                        // whole displayed screen.
-                        let sel = buf.extract_selection_text();
-                        if sel.is_empty() {
-                            buf.displayed_text.join("\n")
-                        } else {
-                            sel
-                        }
-                    }
-                    None => String::new(),
+            let text = term_buf(&bufs, tab_id.as_str()).map(|h| {
+                let buf = h.lock().unwrap();
+                // Copy the drag-selection when there is one, else the
+                // whole displayed screen.
+                let sel = buf.extract_selection_text();
+                if sel.is_empty() {
+                    buf.displayed_text.join("\n")
+                } else {
+                    sel
                 }
-            };
+            }).unwrap_or_default();
             // Run the clipboard write on a dedicated OS thread.  arboard's
             // Windows backend opens the clipboard and pumps Win32 messages;
             // doing that on the Slint/winit event-loop thread re-enters the
@@ -6430,7 +6613,8 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_clear_terminal(move |tab_id: SharedString| {
             let tid = tab_id.to_string();
-            if let Some(buf) = bufs_clear.lock().unwrap().get_mut(&tid) {
+            if let Some(h) = term_buf(&bufs_clear, &tid) {
+                let mut buf = h.lock().unwrap();
                 let (rows, cols) = buf.parser.screen().size();
                 buf.parser = vt100::Parser::new(rows, cols, 5000);
                 buf.find_query.clear();
@@ -6467,15 +6651,10 @@ fn wire_key_input(
         window.on_find_query_changed(move |tab_id: SharedString, query: SharedString| {
             let tid = tab_id.to_string();
             let q = query.to_string();
-            let matches = {
-                let mut map = bufs_find.lock().unwrap();
-                if let Some(buf) = map.get_mut(&tid) {
-                    buf.find_query = q.clone();
-                    compute_find_matches(&buf.displayed_text, &q)
-                } else {
-                    Vec::new()
-                }
-            };
+            let matches = with_term_buf(&bufs_find, &tid, |buf| {
+                buf.find_query = q.clone();
+                compute_find_matches(&buf.displayed_text, &q)
+            }).unwrap_or_default();
             if let Some(win) = weak.upgrade() {
                 let model = ModelRc::from(Rc::new(VecModel::from(matches)));
                 set_terminal_row(&win, &tid, |row| {
@@ -6491,15 +6670,13 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_terminal_scroll(move |tab_id: SharedString, delta: i32| {
             let tid = tab_id.to_string();
-            {
-                let mut map = bufs_scroll.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+            with_term_buf(&bufs_scroll, &tid, |buf| {
                 // Scroll within our own session scrollback (history lines above
                 // the live screen).  Offset 0 = live bottom.
                 let max_off = buf.history.len() as i64;
                 let cur = buf.view_offset as i64;
                 buf.view_offset = (cur + delta as i64).clamp(0, max_off) as usize;
-            }
+            });
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
             }
@@ -6517,9 +6694,8 @@ fn wire_key_input(
         let handles_wheel = handles.clone();
         window.on_terminal_wheel(move |tab_id: SharedString, dir: i32, col: i32, row: i32| {
             let tid = tab_id.to_string();
-            let bytes = {
-                let map = bufs_wheel.lock().unwrap();
-                let Some(buf) = map.get(&tid) else { return };
+            let bytes = term_buf(&bufs_wheel, &tid).map(|h| {
+                let buf = h.lock().unwrap();
                 let screen = buf.parser.screen();
                 if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
                     // 1-based cell under the cursor, clamped to the screen.
@@ -6551,8 +6727,8 @@ fn wire_key_input(
                     };
                     one.repeat(3)
                 }
-            };
-            if let Some(h) = handles_wheel.borrow().get(&tid) {
+            });
+            if let (Some(bytes), Some(h)) = (bytes, handles_wheel.borrow().get(&tid)) {
                 h.send_raw(bytes);
             }
         });
@@ -6564,12 +6740,10 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_terminal_scroll_to(move |tab_id: SharedString, offset: i32| {
             let tid = tab_id.to_string();
-            {
-                let mut map = bufs_scroll.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+            with_term_buf(&bufs_scroll, &tid, |buf| {
                 let max_off = buf.history.len() as i64;
                 buf.view_offset = (offset as i64).clamp(0, max_off) as usize;
-            }
+            });
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
             }
@@ -6582,9 +6756,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_term_select_start(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
-            {
-                let mut map = bufs_sel.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+            with_term_buf(&bufs_sel, &tid, |buf| {
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
                 let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
@@ -6592,7 +6764,7 @@ fn wire_key_input(
                 let abs = buf.vis_to_abs(r);
                 buf.sel_anchor = Some((abs, c));
                 buf.sel_focus = Some((abs, c));
-            }
+            });
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
             }
@@ -6603,9 +6775,7 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_term_select_update(move |tab_id: SharedString, row: i32, col: i32| {
             let tid = tab_id.to_string();
-            {
-                let mut map = bufs_sel.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+            with_term_buf(&bufs_sel, &tid, |buf| {
                 let (rows, cols) = buf.parser.screen().size();
                 let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16;
                 let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16;
@@ -6613,7 +6783,7 @@ fn wire_key_input(
                     let abs = buf.vis_to_abs(r);
                     buf.sel_focus = Some((abs, c));
                 }
-            }
+            });
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_sel, &tid);
             }
@@ -6626,9 +6796,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             // Extract the selected text; a zero-area selection (a plain click)
             // is cleared instead of copied.
-            let text = {
-                let mut map = bufs_sel.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+            let text = with_term_buf(&bufs_sel, &tid, |buf| {
                 let extracted = buf.extract_selection_text();
                 if extracted.is_empty() {
                     // Zero-area selection (a plain click) → clear it.
@@ -6638,7 +6806,7 @@ fn wire_key_input(
                 } else {
                     Some(extracted)
                 }
-            };
+            }).flatten();
             match text {
                 Some(t) if !t.is_empty() => {
                     // Auto-copy on release (select-to-copy, PuTTY style).
@@ -6660,9 +6828,9 @@ fn wire_key_input(
         let weak = window.as_weak();
         window.on_term_select_autoscroll(move |tab_id: SharedString, dir: i32| {
             let tid = tab_id.to_string();
+            let Some(h) = term_buf(&bufs_sel, &tid) else { return };
             {
-                let mut map = bufs_sel.lock().unwrap();
-                let Some(buf) = map.get_mut(&tid) else { return };
+                let mut buf = h.lock().unwrap();
                 // No scrollback on the alternate screen (vim/btop own the view).
                 if buf.parser.screen().alternate_screen() {
                     return;
