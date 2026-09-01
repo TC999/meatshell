@@ -18,7 +18,7 @@
         UpgradeCode="6E8F2A1B-3C4D-4E5F-9A0B-1C2D3E4F5A6B"
         Manufacturer="meatshell contributors"
         Language="1033"
-        Codepage="1252"
+        Codepage="65001"
         Version="$(var.Version)">
 
         <Package Id="*"
@@ -29,7 +29,7 @@
             Languages="1033"
             Compressed="yes"
             InstallScope="perMachine"
-            SummaryCodepage="1252"/>
+            SummaryCodepage="65001"/>
 
         <!-- Replace an older install in place instead of erroring out. -->
         <MajorUpgrade
