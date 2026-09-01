@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="windows-1252"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
   WiX (v3) installer definition for meatshell, driven by `cargo wix`.
 
@@ -134,7 +134,7 @@
                                 KeyPath="yes"/>
                             <RegistryValue Type="string"
                                 Name="command"
-                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%%V"'/>
                         </RegistryKey>
                     </Component>
                     <Component Id="ContextMenuDirectoryBackground"
