@@ -23,6 +23,28 @@ use std::time::Duration;
 
 const MSG_NEW_WINDOW: &str = "new-window";
 
+/// Payload sent over the single-instance IPC channel.  Format:
+/// `<command>\t<path>` where `command` is one of the constants above and
+/// `path` is empty for plain new-window and holds the target folder for
+/// `--dir`.  The primary parses it and decides whether to `cd` into a
+/// directory when it opens the new window.
+pub fn build_msg(directory: Option<&str>) -> String {
+    match directory {
+        Some(dir) => format!("{MSG_NEW_WINDOW}\t{dir}"),
+        None => format!("{MSG_NEW_WINDOW}\t"),
+    }
+}
+
+/// Parse the payload into (`command`, `directory?`).  Unknown commands
+/// are ignored so a future version can add commands without breaking older
+/// primaries (they'll just see `None` for directory).
+pub fn parse_msg(line: &str) -> (&str, Option<&str>) {
+    let mut parts = line.splitn(2, '\t');
+    let cmd = parts.next().unwrap_or("");
+    let dir = parts.next().and_then(|d| if d.is_empty() { None } else { Some(d) });
+    (cmd, dir)
+}
+
 #[derive(Debug)]
 pub enum Instance {
     /// This process owns the endpoint. `listen` accepts forwarded requests.
@@ -37,34 +59,30 @@ pub enum Instance {
 /// live primary is reported as an error so a plain relaunch runs as its own
 /// instance instead of opening a bonus window in the first one. Never
 /// panics on IO trouble — callers treat errors as "just run normally".
+/// `directory`, when `Some`, is the target folder for the `--dir` verb.
 #[cfg(unix)]
-pub fn acquire(socket_path: &Path, forward: bool) -> std::io::Result<Instance> {
+pub fn acquire(
+    socket_path: &Path,
+    forward: bool,
+    directory: Option<&str>,
+) -> std::io::Result<Instance> {
     if let Ok(listener) = UnixListener::bind(socket_path) {
         return Ok(Instance::Primary {
             listen: Listener { listener },
         });
     }
-    // Bind failed: either a live primary owns the socket, or the file is
-    // stale (the previous primary exited without unlinking it). Probe with
-    // a connect, mirroring the stale port-file logic on Windows.
     match UnixStream::connect(socket_path) {
         Ok(mut stream) => {
             if !forward {
-                // A plain launch must not forward: report the live primary
-                // and let run() fall back to a normal second instance.
                 return Err(std::io::Error::other(
                     "single-instance primary already running",
                 ));
             }
-            stream.write_all(format!("{MSG_NEW_WINDOW}\n").as_bytes())?;
+            stream.write_all(format!("{}\n", build_msg(directory)).as_bytes())?;
             stream.flush()?;
             Ok(Instance::Forwarded)
         }
         Err(_) => {
-            // Nothing is listening, so the file is stale. Remove it and
-            // retry the bind once. Shutdown-time unlinking is deliberately
-            // not attempted: it cannot run for a killed process, so this
-            // retry is the robust recovery.
             let _ = std::fs::remove_file(socket_path);
             let listener = UnixListener::bind(socket_path)?;
             Ok(Instance::Primary {
@@ -76,44 +94,35 @@ pub fn acquire(socket_path: &Path, forward: bool) -> std::io::Result<Instance> {
 
 /// `socket_path` is the port-file path here (see module docs).
 #[cfg(windows)]
-pub fn acquire(socket_path: &Path, forward: bool) -> std::io::Result<Instance> {
+pub fn acquire(
+    socket_path: &Path,
+    forward: bool,
+    directory: Option<&str>,
+) -> std::io::Result<Instance> {
     let port_file = socket_path;
-    // A live primary? Connect with a short timeout; a stale port file
-    // (parse error, refused/timeout connection) is treated as "no primary".
     if let Some(port) = read_port_file(port_file) {
         if forward {
-            if forward_tcp(port).is_ok() {
+            if forward_tcp(port, directory).is_ok() {
                 return Ok(Instance::Forwarded);
             }
         } else if connect_tcp(port).is_ok() {
-            // A plain launch must not forward (and must not steal the port
-            // file): report the live primary and let run() fall back to a
-            // normal second instance.
             return Err(std::io::Error::other(
                 "single-instance primary already running",
             ));
         }
     }
-    // No live primary: start one on an ephemeral loopback port.
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
-    // Without the port file nobody can find us; let the caller fall back
-    // to a normal launch.
     std::fs::write(port_file, port.to_string())?;
-    // Two processes can both see "no primary" and both reach this point.
-    // Whoever wrote the port file last wins; re-check and defer if we lost.
     if read_port_file(port_file) != Some(port) {
         drop(listener);
         if forward {
             if let Some(winner) = read_port_file(port_file) {
-                if forward_tcp(winner).is_ok() {
+                if forward_tcp(winner, directory).is_ok() {
                     return Ok(Instance::Forwarded);
                 }
             }
         }
-        // Degradation: the race-loser could not reach the winner, so a
-        // `--new-window` launch falls back to a second instance; rare and
-        // acceptable.
         return Err(std::io::Error::other("lost single-instance race"));
     }
     Ok(Instance::Primary {
@@ -128,13 +137,10 @@ fn connect_tcp(port: u16) -> std::io::Result<TcpStream> {
 }
 
 #[cfg(windows)]
-fn forward_tcp(port: u16) -> std::io::Result<Instance> {
+fn forward_tcp(port: u16, directory: Option<&str>) -> std::io::Result<Instance> {
     let mut stream = connect_tcp(port)?;
-    stream.write_all(format!("{MSG_NEW_WINDOW}\n").as_bytes())?;
+    stream.write_all(format!("{}\n", build_msg(directory)).as_bytes())?;
     stream.flush()?;
-    // Whoever holds the port must ack: a stale port file can point at an
-    // unrelated listener, and treating that as Forwarded would exit without
-    // any window ever opening.
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     match BufReader::new(&stream).lines().next() {
         Some(Ok(line)) if line == "ack" => Ok(Instance::Forwarded),
@@ -173,17 +179,16 @@ impl Listener {
     /// Spawn this on its own thread. Every accepted line is acked before
     /// dispatch so forwarders can verify they reached the real primary —
     /// on Windows the port file may stale and point at an unrelated
-    /// listener, which would never ack.
-    pub fn spawn<F: FnMut(String) + Send + 'static>(self, mut on_msg: F) {
+    /// listener, which would never ack. `on_msg` receives the directory
+    /// path the forwarder asked for (or None for a plain new-window).
+    pub fn spawn<F: FnMut(Option<String>) + Send + 'static>(self, mut on_msg: F) {
         for mut stream in self.listener.incoming().flatten() {
-            // One silent client must not wedge every later forward: bound
-            // the wait for the first line and skip the connection if it
-            // times out.
             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             if let Some(Ok(line)) = BufReader::new(&stream).lines().next() {
                 let _ = stream.write_all(b"ack\n");
                 let _ = stream.flush();
-                on_msg(line);
+                let (_cmd, dir) = parse_msg(&line);
+                on_msg(dir.map(str::to_owned));
             }
         }
     }
