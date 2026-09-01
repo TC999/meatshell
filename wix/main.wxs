@@ -111,6 +111,60 @@
                             Value="[APPLICATIONFOLDER]"
                             KeyPath="yes"/>
                     </Component>
+
+                    <!--
+                      Explorer context-menu verb "在此处打开 meatshell":
+                      registered under HKCR so it survives across installs.
+                      WiX needs one component per registry root, so three
+                      separate components below cover folder, empty-canvas
+                      and file right-clicks.  Uninstall removes the whole
+                      subtree cleanly (Remove="uninstall" on the default
+                      value).  We install per-machine so the entries are
+                      visible to all users.  See src/app/registry_menu.rs
+                      for the equivalent runtime path.
+                    -->
+                    <Component Id="ContextMenuDirectory"
+                               Guid="{B1D6F4F9-2D1C-4E7A-8B9F-3A0D5C6E7F8A}"
+                               Win64="yes">
+                        <RegistryKey Root="HKCR"
+                            Key="Directory\shell\meatshell"
+                            ForceDeleteOnUninstall="yes">
+                            <RegistryValue Type="string"
+                                Value="在此处打开 meatshell"
+                                KeyPath="yes"/>
+                            <RegistryValue Type="string"
+                                Name="command"
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                        </RegistryKey>
+                    </Component>
+                    <Component Id="ContextMenuDirectoryBackground"
+                               Guid="{C2E7A5A0-3E2D-5F8B-9C0A-4B1E6D7F8A9B}"
+                               Win64="yes">
+                        <RegistryKey Root="HKCR"
+                            Key="Directory\Background\shell\meatshell"
+                            ForceDeleteOnUninstall="yes">
+                            <RegistryValue Type="string"
+                                Value="在此处打开 meatshell"
+                                KeyPath="yes"/>
+                            <RegistryValue Type="string"
+                                Name="command"
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                        </RegistryKey>
+                    </Component>
+                    <Component Id="ContextMenuFile"
+                               Guid="{D3F8B6B1-4F3E-6A9C-0D1B-5C2F7E8A9C0D}"
+                               Win64="yes">
+                        <RegistryKey Root="HKCR"
+                            Key="*\shell\meatshell"
+                            ForceDeleteOnUninstall="yes">
+                            <RegistryValue Type="string"
+                                Value="在此处打开 meatshell"
+                                KeyPath="yes"/>
+                            <RegistryValue Type="string"
+                                Name="command"
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                        </RegistryKey>
+                    </Component>
                 </Directory>
             </Directory>
             <Directory Id="ProgramMenuFolder">
@@ -153,6 +207,9 @@
             <ComponentRef Id="MainExecutable"/>
             <ComponentRef Id="ThirdPartyNotices"/>
             <ComponentRef Id="InstallLocationRegistry"/>
+            <ComponentRef Id="ContextMenuDirectory"/>
+            <ComponentRef Id="ContextMenuDirectoryBackground"/>
+            <ComponentRef Id="ContextMenuFile"/>
             <ComponentRef Id="ApplicationShortcut"/>
             <ComponentRef Id="DesktopShortcut"/>
         </Feature>
