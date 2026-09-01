@@ -271,7 +271,7 @@ pub(super) fn handle_global_tab_drag_drop(
         return true;
     };
     let at = clamped_detach_position(&src_win, gx, gy);
-    match open_window(core.clone(), false, Some(at)) {
+    match open_window(core.clone(), false, Some(at), None) {
         Ok(new_id) => {
             tracing::warn!("tab-drop: detach into new window {new_id}");
             {

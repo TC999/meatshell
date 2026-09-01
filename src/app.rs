@@ -11,6 +11,8 @@ pub(crate) mod core;
 mod jump_list;
 pub mod launch;
 mod port_forward;
+#[cfg(windows)]
+mod registry_menu;
 mod session_trigger;
 mod quick_commands;
 mod resource_ui;
@@ -441,7 +443,11 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // taken they run as an independent second instance. IPC failures fall
     // through to a normal launch rather than blocking the app.
     let si_path = crate::app::single_instance::socket_path();
-    let instance = match crate::app::single_instance::acquire(&si_path, intent.new_window) {
+    let instance = match crate::app::single_instance::acquire(
+        &si_path,
+        intent.new_window,
+        intent.directory.as_deref(),
+    ) {
         Ok(i) => Some(i),
         Err(e) => {
             tracing::warn!("single-instance acquire failed: {e}");
@@ -480,23 +486,21 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // no request is lost.
     if let Some(crate::app::single_instance::Instance::Primary { listen }) = instance {
         std::thread::spawn(move || {
-            listen.spawn(move |msg| {
-                if msg == "new-window" {
-                    tracing::info!("single-instance: new-window request received");
-                    // invoke_from_event_loop fails forever once the event
-                    // loop is gone (app quitting) — retry only briefly so
-                    // this listener callback cannot spin indefinitely.
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    while slint::invoke_from_event_loop(|| {
+            listen.spawn(move |dir| {
+                tracing::info!(directory = ?dir, "single-instance: new-window request received");
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(10);
+                // `invoke_from_event_loop` takes a `'static` FnOnce, so we
+                // build a fresh closure for each retry with the directory
+                // path cloned inside it.  `dir` outlives the loop body, so
+                // each clone is a new owned copy.
+                while slint::invoke_from_event_loop({
+                    let dir = dir.clone();
+                    move || {
                         NEW_WINDOW_CORE.with(|c| {
                             if let Some(core) = c.borrow().clone() {
-                                match open_window(core.clone(), true, None) {
+                                match open_window(core.clone(), true, None, dir) {
                                     Ok(window_id) => {
-                                        // The request came from an OS entry
-                                        // point while we may be in the
-                                        // background — bring the new window
-                                        // to the front (best effort).
                                         if let Some(st) =
                                             core.window_states.borrow().get(&window_id)
                                         {
@@ -511,19 +515,17 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
                                 }
                             }
                         });
-                    })
-                    .is_err()
-                    {
-                        if std::time::Instant::now() >= deadline {
-                            tracing::warn!(
-                                "single-instance: event loop unreachable, dropping new-window request"
-                            );
-                            break;
-                        }
-                        // The event loop provider appears after startup begins;
-                        // retry instead of dropping an explicit user action.
-                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
+                })
+                .is_err()
+                {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "single-instance: event loop unreachable, dropping new-window request"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             });
         });
@@ -535,13 +537,16 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
 
-    // Taskbar jump list ("新建窗口") on Windows: register before the first
-    // window shows so the entry is available immediately. Failure is
-    // warn-only and never blocks startup.
+    // Taskbar jump list ("新建窗口") and Explorer context menu ("在此处打开
+    // Meatshell") on Windows: register both before the first window shows so
+    // the entries are available immediately. Failure is warn-only and never
+    // blocks startup.
     #[cfg(windows)]
     crate::app::jump_list::register_new_window_task();
+    #[cfg(windows)]
+    crate::app::registry_menu::register_directory_menu();
 
-    open_window(core.clone(), false, None)?;
+    open_window(core.clone(), false, None, intent.directory.clone())?;
 
     // Publish the core to the UI thread so the IPC listener's
     // invoke_from_event_loop closures can open windows without capturing the
@@ -576,12 +581,16 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
 /// Build and wire one application window. Called for the first window by
 /// `run()` and for every subsequent window by the new-window entry points.
 /// `at` pins the window to a physical screen position (tab detach); without
-/// it the window cascades from the newest one or centers.
+/// it the window cascades from the newest one or centers. `directory`, when
+/// set, opens a Local PowerShell session whose working directory is that
+/// path — used by the Windows Explorer context-menu verb "在此处打开
+/// Meatshell".
 /// Returns the registry id used to unregister on close.
 fn open_window(
     core: Rc<AppCore>,
     cascade: bool,
     at: Option<slint::PhysicalPosition>,
+    directory: Option<String>,
 ) -> Result<u64> {
     let runtime = core.runtime.clone();
     let store = core.store.clone();
@@ -2409,7 +2418,7 @@ fn open_window(
     {
         let core = core.clone();
         window.on_new_window_clicked(move || {
-            if let Err(e) = open_window(core.clone(), true, None) {
+            if let Err(e) = open_window(core.clone(), true, None, None) {
                 tracing::warn!("failed to open new window: {e:#}");
             }
         });
@@ -3075,6 +3084,46 @@ fn open_window(
                 None => center_window(&w),
             }
         });
+    }
+
+    // If this window was launched via `--dir <path>`, wire the existing
+    // on_connect_session handler to open a Local PowerShell session whose
+    // working directory is that path.  The session is staged into the store
+    // (display-name only, not persisted) so the existing tab-spawn path is
+    // reused unchanged — the shell ends up in `session.local_working_dir`
+    // (#explorer-context-menu).
+    if let Some(target_dir) = directory {
+        let weak_win = window.as_weak();
+            // Build a session that names the target directory in its display
+            // title and carries the path in `local_working_dir` so
+            // terminal::local sees it when spawning cmd/powershell/wsl.
+            let short = {
+                let p = std::path::Path::new(&target_dir);
+                if let Some(f) = p.file_name() {
+                    f.to_string_lossy().to_string()
+                } else {
+                    target_dir.clone()
+                }
+            };
+            let mut session = Session::new_empty();
+            session.id = "context-menu".to_string();
+            session.name = format!("{} ({})", short, t("在此处打开", "Open here"));
+            session.host = "powershell".to_string();
+            session.user = std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_default();
+            session.group = "system".to_string();
+            session.kind = SessionKind::Local;
+            session.local_working_dir = target_dir;
+            store
+                .borrow_mut()
+                .upsert(session);
+            // Fire the tab creation through the existing connect_session path.
+            slint::Timer::single_shot(std::time::Duration::from_millis(10), move || {
+                if let Some(w) = weak_win.upgrade() {
+                    w.invoke_connect_session("context-menu".into());
+                }
+            });
     }
 
     // The old entry point was window.run(), which shows the window before
