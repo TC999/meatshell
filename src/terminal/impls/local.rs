@@ -179,16 +179,22 @@ async fn run_local(
 }
 
 fn local_program(session: &Session) -> (String, Vec<String>) {
+    let cwd = session.local_working_dir.trim();
+    let want_cd = !cwd.is_empty();
     match session.host.as_str() {
         #[cfg(windows)]
-        "cmd" => (
-            "cmd.exe".to_string(),
-            vec![
+        "cmd" => {
+            let mut args = vec![
                 "/Q".to_string(),
                 "/K".to_string(),
                 "chcp 65001>nul".to_string(),
-            ],
-        ),
+            ];
+            if want_cd {
+                // Quote the path; `/K` runs the command string in cmd.exe.
+                args.push(format!("cd /D \"{cwd}\""));
+            }
+            ("cmd.exe".to_string(), args)
+        }
         #[cfg(windows)]
         "wsl" => {
             let mut args = Vec::new();
@@ -197,16 +203,11 @@ fn local_program(session: &Session) -> (String, Vec<String>) {
                 args.push(session.local_distribution.clone());
             }
             args.push("--cd".to_string());
-            args.push(if session.local_working_dir.trim().is_empty() {
+            args.push(if cwd.is_empty() {
                 "~".to_string()
             } else {
-                session.local_working_dir.clone()
+                cwd.to_string()
             });
-            // Do not rely on wsl.exe's implicit shell launch. In particular,
-            // Arch WSL installations whose passwd login shell is fish can open
-            // a PTY without ever presenting an interactive prompt (#352).
-            // Resolve the current Linux user's configured shell inside the
-            // distribution, then replace the temporary POSIX shell with it.
             args.extend([
                 "--exec".to_string(),
                 "/bin/sh".to_string(),
@@ -216,19 +217,40 @@ fn local_program(session: &Session) -> (String, Vec<String>) {
             ("wsl.exe".to_string(), args)
         }
         #[cfg(windows)]
-        "powershell" | _ => (
-            "powershell.exe".to_string(),
-            vec![
+        "powershell" | _ => {
+            let cd_tail = if want_cd {
+                format!("; Set-Location -LiteralPath '{cwd}'", cwd = cwd.replace('\'', "''"))
+            } else {
+                String::new()
+            };
+            ("powershell.exe".to_string(), vec![
                 "-NoLogo".to_string(),
                 "-NoExit".to_string(),
                 "-Command".to_string(),
-                "$utf8 = New-Object System.Text.UTF8Encoding $false; [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8".to_string(),
-            ],
-        ),
+                format!(
+                    "$utf8 = New-Object System.Text.UTF8Encoding $false; [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8{cd}",
+                    cd = cd_tail
+                ),
+            ])
+        }
         #[cfg(not(windows))]
         _ => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            (shell, Vec::new())
+            // The PTY's current dir is the app's, so if the user asked for a
+            // specific cwd, shell out through `cd -P` before invoking the login
+            // shell interactively. `cd -P` resolves symlinks so pwd reports the
+            // canonical path.
+            if want_cd {
+                (
+                    "/bin/sh".to_string(),
+                    vec![
+                        "-lc".to_string(),
+                        format!("cd -P '{cwd}' && exec -a 0 -l {shell}", cwd = cwd.replace('\'', "'\\''")),
+                    ],
+                )
+            } else {
+                (shell, Vec::new())
+            }
         }
     }
 }
@@ -250,6 +272,27 @@ mod tests {
         session.host = "cmd".to_string();
         let (_, cmd_args) = local_program(&session);
         assert!(cmd_args.iter().any(|arg| arg.contains("chcp 65001")));
+        assert!(cmd_args.iter().all(|a| !a.starts_with("cd ")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_cd_into_working_dir() {
+        let mut session = Session::new_empty();
+        session.host = "powershell".to_string();
+        session.local_working_dir = r"C:\Users\me\proj".to_string();
+        let (_, args) = local_program(&session);
+        assert!(args.iter().any(|a| a.contains("Set-Location -LiteralPath")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_cd_into_working_dir() {
+        let mut session = Session::new_empty();
+        session.host = "cmd".to_string();
+        session.local_working_dir = r"C:\Users\me\proj".to_string();
+        let (_, args) = local_program(&session);
+        assert!(args.iter().any(|a| a == "cd /D \"C:\\Users\\me\\proj\""));
     }
 
     #[cfg(windows)]
