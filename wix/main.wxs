@@ -168,7 +168,7 @@
             Execute="immediate"/>
 
         <!--
-          Register the Explorer context-menu verb ("在此处打开 meatshell")
+          Register the Explorer context-menu verb (Chinese display name
           right after the MSI finishes installing.  WiX 3.14's light tool
           forces an ANSI codepage for any string it processes, so we cannot
           write the Chinese menu text from WiX itself.  Instead we call the
