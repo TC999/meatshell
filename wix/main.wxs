@@ -174,12 +174,39 @@
             Property="ARPINSTALLLOCATION"
             Value="[APPLICATIONFOLDER]"
             Execute="immediate"/>
+
+        <!-- JScript deferred CA.  WiX 3 external-exe CustomActions are
+             unreliable in practice (deferred Property+ExeCommand = silent
+             no-op, immediate Directory+ExeCommand = error 1721 on many
+             MSI transactions), so we use a Type-51 deferred CA that
+             runs JScript inside the elevated MSI process.  The script
+             reads the APPLICATIONFOLDER MSI property, builds the full
+             path to meatshell.exe, and launches it with
+             the register-context-menu flag.  The JS engine and WScript.Shell
+             are always available on Windows, so no external DLLs are
+             needed.  The CA also writes a small marker so the runtime
+             can detect that install-time registration was attempted.
+        -->
         <CustomAction Id="RegisterContextMenuVerb"
-            Directory="APPLICATIONFOLDER"
-            ExeCommand="&quot;meatshell.exe&quot; --register-context-menu"
-            Execute="immediate"
+            Script="jscript"
             Return="check"
-            Impersonate="no"/>
+            Execute="deferred"
+            Impersonate="no">
+            try {
+              var appFolder = Session.Property("APPLICATIONFOLDER");
+              var exePath = '"' + appFolder + '\\\\meatshell.exe"';
+              var shell = new ActiveXObject("WScript.Shell");
+              var exitCode = shell.Run(exePath + ' --register-context-menu', 0, true);
+              if (exitCode !== 0) {
+                Session.Message(0x0400, ['meatshell.exe failed with exit code ' + exitCode]);
+                return 1603;
+              }
+              return 0;
+            } catch (e) {
+              Session.Message(0x0400, ['registration failed: ' + e.message]);
+              return 1603;
+            }
+        </CustomAction>
 
         <InstallExecuteSequence>
             <Custom Action="SetARPInstallLocation" After="CostFinalize">NOT REMOVE</Custom>
