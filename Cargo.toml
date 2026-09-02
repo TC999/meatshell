@@ -160,3 +160,10 @@ opt-level = 1
 # Avoid Slint/winit's AppKit DisplayLink selector on old macOS. The local
 # patched backend falls back to timer throttling on macOS only.
 i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
+
+# cargo-wix (WiX v3) invocation.  candle/light need an explicit codepage
+# flag; without -ccp 65001 they default to 1252 and reject the Chinese
+# characters in the Explorer context-menu verb ("在此处打开 meatshell").
+[package.metadata.wix]
+candle_args = ["-ccp", "65001"]
+light_args = ["-ccp", "65001"]
