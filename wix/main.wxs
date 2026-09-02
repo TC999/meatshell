@@ -162,8 +162,28 @@
             Property="ARPINSTALLLOCATION"
             Value="[APPLICATIONFOLDER]"
             Execute="immediate"/>
+
+        <!--
+          Register the Explorer context-menu verb ("在此处打开 meatshell")
+          right after the MSI finishes installing.  We cannot write the
+          Chinese string from WiX directly (light forces an ANSI codepage
+          and rejects it), so we call the installed meatshell.exe with a
+          special flag that writes the registry keys via FFI and exits.
+          The action runs deferred so it executes under elevated privileges
+          needed to touch HKCR in per-machine scope.  On uninstall it is
+          skipped so the keys remain until the app next launches; the
+          runtime also cleans them up on exit if desired.
+        -->
+        <CustomAction Id="RegisterContextMenuVerb"
+            Directory="APPLICATIONFOLDER"
+            ExeCommand="&quot;[APPLICATIONFOLDER]meatshell.exe&quot; --register-context-menu"
+            Execute="deferred"
+            Return="ignore"
+            Impersonate="no"/>
+
         <InstallExecuteSequence>
             <Custom Action="SetARPInstallLocation" After="CostFinalize">NOT REMOVE</Custom>
+            <Custom Action="RegisterContextMenuVerb" Before="InstallFinalize">NOT REMOVE</Custom>
         </InstallExecuteSequence>
 
         <!-- "Choose install location" wizard page (needs WixUIExtension). -->

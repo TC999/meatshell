@@ -13,11 +13,13 @@ mod launch_intent_tests;
 pub struct LaunchIntent {
     pub new_window: bool,
     pub directory: Option<String>,
+    pub register_context_menu: bool,
 }
 
 pub fn parse(args: &[String]) -> LaunchIntent {
     let mut directory: Option<String> = None;
     let mut new_window = false;
+    let mut register_context_menu = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--new-window" {
@@ -25,8 +27,14 @@ pub fn parse(args: &[String]) -> LaunchIntent {
         } else if args[i] == "--dir" && i + 1 < args.len() {
             directory = Some(args[i + 1].clone());
             i += 1;
+        } else if args[i] == "--register-context-menu" {
+            register_context_menu = true;
         }
         i += 1;
     }
-    LaunchIntent { new_window, directory }
+    LaunchIntent {
+        new_window,
+        directory,
+        register_context_menu,
+    }
 }

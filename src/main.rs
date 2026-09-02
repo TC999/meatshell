@@ -26,6 +26,8 @@ enum StartMode {
     Cli,
     App,
     Version,
+    #[cfg(windows)]
+    RegisterContextMenu,
 }
 
 impl StartMode {
@@ -34,9 +36,11 @@ impl StartMode {
             Some("mcp") if args.get(2).is_some_and(|arg| arg == "serve") => Self::Mcp,
             Some("cli") => Self::Cli,
             _ if args.iter().any(|arg| arg == "--version" || arg == "-V") => Self::Version,
+            #[cfg(windows)]
+            _ if args.iter().any(|arg| arg == "--register-context-menu") => Self::RegisterContextMenu,
             _ => Self::App,
         }
-    } 
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,6 +57,12 @@ fn main() -> anyhow::Result<()> {
     match mode {
         StartMode::Mcp => mcp::run_stdio(),
         StartMode::Cli => cli::run(&args),
+        #[cfg(windows)]
+        StartMode::RegisterContextMenu => {
+            tracing::info!("registering Explorer context-menu verb");
+            app::registry_menu::register_directory_menu();
+            return Ok(());
+        }
         StartMode::App => {
             // macOS defaults to Slint's CPU renderer. FemtoVG and Skia remain available
             // in Settings -> Interface -> Rendering for users who prefer GPU rendering.

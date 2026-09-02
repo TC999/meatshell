@@ -12,7 +12,7 @@ mod jump_list;
 pub mod launch;
 mod port_forward;
 #[cfg(windows)]
-mod registry_menu;
+pub(crate) mod registry_menu;
 mod session_trigger;
 mod quick_commands;
 mod resource_ui;
