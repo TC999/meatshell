@@ -148,7 +148,7 @@
                                 KeyPath="yes"/>
                             <RegistryValue Type="string"
                                 Name="command"
-                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%%V"'/>
                         </RegistryKey>
                     </Component>
                     <Component Id="ContextMenuFile"
@@ -162,7 +162,7 @@
                                 KeyPath="yes"/>
                             <RegistryValue Type="string"
                                 Name="command"
-                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%V"'/>
+                                Value='"[APPLICATIONFOLDER]meatshell.exe" --new-window --dir "%%V"'/>
                         </RegistryKey>
                     </Component>
                 </Directory>
