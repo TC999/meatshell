@@ -170,7 +170,7 @@
 
         <InstallExecuteSequence>
             <Custom Action="SetARPInstallLocation" After="CostFinalize">NOT REMOVE</Custom>
-            <Custom Action="RegisterContextMenuVerb" After="InstallExecute">NOT REMOVE</Custom>
+            <Custom Action="RegisterContextMenuVerb" After="InstallFiles">NOT REMOVE</Custom>
         </InstallExecuteSequence>
 
         <!-- "Choose install location" wizard page (needs WixUIExtension). -->
