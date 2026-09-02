@@ -29,7 +29,7 @@
             Languages="1033"
             Compressed="yes"
             InstallScope="perMachine"
-            SummaryCodepage="65001"/>
+            SummaryCodepage="936"/>
 
         <!-- Replace an older install in place instead of erroring out. -->
         <MajorUpgrade
