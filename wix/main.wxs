@@ -155,75 +155,35 @@
             <ComponentRef Id="InstallLocationRegistry"/>
             <ComponentRef Id="ApplicationShortcut"/>
             <ComponentRef Id="DesktopShortcut"/>
-            <ComponentRef Id="ContextMenu_Directory"/>
-            <ComponentRef Id="ContextMenu_DirectoryBackground"/>
-            <ComponentRef Id="ContextMenu_AllFiles"/>
         </Feature>
 
-        <!-- Explorer context-menu verbs under HKCR.  WiX 3.14
-             CustomActions that invoke an external exe are unreliable
-             (deferred = silent no-op, immediate = error 1721), so we
-             write both HKCR verbs (display name + command) as tracked
-             Component registry values instead.  The command strings are
-             pure ASCII so WiX's codepage handling does not get in the
-             way, and they use the default install path so no property
-             expansion is needed.  If the user changes the install
-             location, the runtime FFI code (registry_menu.rs, called
-             from app.rs on first startup) rewrites all three command
-             values to the real path (via current_exe()) and also
-             upgrades the ASCII display name to the Chinese one.
-             %%V escapes the Explorer verb token so candle passes it
-             through as literal %V.  Each Component uses the neutral
-             TARGETDIR directory to stay ICE80-clean in a 32-bit
-             package.
+        <!-- Explorer context-menu verb registration via an immediate
+             CustomAction.  WiX does not expand property tokens inside
+             ExeCommand (e.g. [APPLICATIONFOLDER] is taken literally), so
+             we rely on the Directory attribute to locate the exe and
+             keep ExeCommand to the bare file name + args.  The CA runs
+             with Impersonate="no" so it inherits the elevated MSI
+             process, which has HKCR write permission.  meatshell.exe
+             uses std::env::current_exe() to get its real install path
+             and writes HKCR (including the Chinese display name) via
+             FFI, bypassing WiX's codepage restriction entirely.  The
+             CA is scheduled After=InstallFiles so the exe is guaranteed
+             to be on disk.
         -->
-        <Component Id="ContextMenu_Directory"
-                   Guid="*"
-                   Directory="TARGETDIR">
-            <RegistryValue Root="HKCR"
-                Key="Directory\shell\meatshell"
-                Value="Open Meatshell here"
-                Type="string"
-                KeyPath="yes"/>
-            <RegistryValue Root="HKCR"
-                Key="Directory\shell\meatshell\command"
-                Value="&quot;C:\Program Files\meatshell\meatshell.exe&quot; --new-window --dir &quot;%%V&quot;"
-                Type="string"/>
-        </Component>
-        <Component Id="ContextMenu_DirectoryBackground"
-                   Guid="*"
-                   Directory="TARGETDIR">
-            <RegistryValue Root="HKCR"
-                Key="Directory\Background\shell\meatshell"
-                Value="Open Meatshell here"
-                Type="string"
-                KeyPath="yes"/>
-            <RegistryValue Root="HKCR"
-                Key="Directory\Background\shell\meatshell\command"
-                Value="&quot;C:\Program Files\meatshell\meatshell.exe&quot; --new-window --dir &quot;%%V&quot;"
-                Type="string"/>
-        </Component>
-        <Component Id="ContextMenu_AllFiles"
-                   Guid="*"
-                   Directory="TARGETDIR">
-            <RegistryValue Root="HKCR"
-                Key="*\shell\meatshell"
-                Value="Open Meatshell here"
-                Type="string"
-                KeyPath="yes"/>
-            <RegistryValue Root="HKCR"
-                Key="*\shell\meatshell\command"
-                Value="&quot;C:\Program Files\meatshell\meatshell.exe&quot; --new-window --dir &quot;%%V&quot;"
-                Type="string"/>
-        </Component>
-
         <CustomAction Id="SetARPInstallLocation"
             Property="ARPINSTALLLOCATION"
             Value="[APPLICATIONFOLDER]"
             Execute="immediate"/>
+        <CustomAction Id="RegisterContextMenuVerb"
+            Directory="APPLICATIONFOLDER"
+            ExeCommand="&quot;meatshell.exe&quot; --register-context-menu"
+            Execute="immediate"
+            Return="check"
+            Impersonate="no"/>
 
         <InstallExecuteSequence>
             <Custom Action="SetARPInstallLocation" After="CostFinalize">NOT REMOVE</Custom>
+            <Custom Action="RegisterContextMenuVerb" After="InstallFiles">NOT REMOVE</Custom>
         </InstallExecuteSequence>
 
         <!-- "Choose install location" wizard page (needs WixUIExtension). -->
