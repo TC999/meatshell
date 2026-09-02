@@ -162,35 +162,15 @@
             Property="ARPINSTALLLOCATION"
             Value="[APPLICATIONFOLDER]"
             Execute="immediate"/>
-        <CustomAction Id="SetContextMenuExePath"
-            Property="CONTEXT_MENU_EXE"
-            Value="[APPLICATIONFOLDER]meatshell.exe"
-            Execute="immediate"/>
-
-        <!--
-          Register the Explorer context-menu verb (Chinese display name
-          right after the MSI finishes installing.  WiX 3.14's light tool
-          forces an ANSI codepage for any string it processes, so we cannot
-          write the Chinese menu text from WiX itself.  Instead we call the
-          installed meatshell.exe with a special flag that writes the
-          registry keys via FFI and exits.
-
-          Two-phase so deferred execution under elevated privileges still has
-          the path: an immediate action sets CONTEXT_MENU_EXE from
-          [APPLICATIONFOLDER] (which is only visible in immediate
-          sequencing), then a deferred action invokes that stored path.
-        -->
         <CustomAction Id="RegisterContextMenuVerb"
-            Property="CONTEXT_MENU_EXE"
-            ExeCommand="--register-context-menu"
-            Execute="deferred"
-            Return="check"
-            Impersonate="no"/>
+            Directory="APPLICATIONFOLDER"
+            ExeCommand="&quot;[APPLICATIONFOLDER]meatshell.exe&quot; --register-context-menu"
+            Execute="immediate"
+            Return="check"/>
 
         <InstallExecuteSequence>
             <Custom Action="SetARPInstallLocation" After="CostFinalize">NOT REMOVE</Custom>
-            <Custom Action="SetContextMenuExePath" After="CostFinalize">NOT REMOVE</Custom>
-            <Custom Action="RegisterContextMenuVerb" Before="InstallFinalize">NOT REMOVE</Custom>
+            <Custom Action="RegisterContextMenuVerb" After="InstallExecute">NOT REMOVE</Custom>
         </InstallExecuteSequence>
 
         <!-- "Choose install location" wizard page (needs WixUIExtension). -->
