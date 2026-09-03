@@ -168,7 +168,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          cargo deb --target ${{ matrix.target }} --no-build
+          cargo deb --target ${{ matrix.target }}
           echo "DEB=$(find target/${{ matrix.target }}/debian -name '*.deb' -print -quit)" >> "$GITHUB_ENV"
 
       - name: Package
