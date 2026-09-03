@@ -111,6 +111,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Feature is additive over the base `arboard = "3"` dependency above.
 arboard = { version = "3", features = ["wayland-data-control"] }
 
+# Use jemalloc on Unix-like desktop/mobile targets. Unsupported targets keep
+# Rust's portable System allocator without pulling in platform dependencies.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "android", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+jemallocator = "0.5"
+
 # Compile the Skia renderer in *only* on macOS (feature is additive over the base
 # slint dependency) so users can opt into it at launch with SLINT_BACKEND=winit-skia.
 # The default stays femtovg 鈥?see the renderer history note in main.rs (#108/#129).
@@ -131,6 +136,7 @@ winresource = "0.1"
 # src/app/jump_list.rs). 0.58 matches the version already in Cargo.lock via
 # transitive deps, keeping the lock diff minimal.
 [target.'cfg(windows)'.dependencies]
+mimalloc = "0.1"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Storage_EnhancedStorage",

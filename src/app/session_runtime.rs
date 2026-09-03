@@ -1,5 +1,18 @@
 use super::*;
 
+/// When a firehose queue contains stale output ahead of its terminal `Closed`
+/// event, keep the close notification and discard the obsolete output. The
+/// disconnected tab is going to be reset anyway; replaying those bytes only
+/// delays cleanup and can temporarily retain hundreds of megabytes.
+pub(super) fn take_closed_event(events: &mut Vec<SessionEvent>) -> Option<SessionEvent> {
+    let index = events
+        .iter()
+        .position(|event| matches!(event, SessionEvent::Closed(_)))?;
+    let closed = events.swap_remove(index);
+    events.clear();
+    Some(closed)
+}
+
 pub(super) fn resolve_jump(store: &Rc<RefCell<ConfigStore>>, session: &Session) -> Option<Session> {
     if session.kind != SessionKind::Ssh || session.jump_session_id.trim().is_empty() {
         return None;
@@ -156,6 +169,33 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                 let Ok(rt) = route_pump.lock().map(|g| g.clone()) else {
                     continue;
                 };
+
+                // A close marker can sit behind a large burst of Output events
+                // in the unbounded channel. Handle it before ingesting anything
+                // from this batch so stale scrollback is released immediately.
+                if let Some(closed) = take_closed_event(&mut drained) {
+                    if let Some(h) = crate::app::term_buf(&rt.bufs, &tab_id_pump) {
+                        h.lock().unwrap().release_scrollback();
+                    }
+                    let rt_evt = rt.clone();
+                    let tid = tab_id_pump.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(win) = rt_evt.window.upgrade() {
+                            apply_session_event_to_window(
+                                &win,
+                                rt_evt.window_id,
+                                &tid,
+                                closed,
+                                &rt_evt.bufs,
+                                &rt_evt.gates,
+                                &rt_evt.statuses,
+                                &rt_evt.local_snap,
+                                &rt_evt.net_hist,
+                            );
+                        }
+                    });
+                    break;
+                }
 
                 // Run CwdChanged side-effects here (off the UI thread), drop the
                 // swallowed ones, and concatenate runs of Output into a single chunk

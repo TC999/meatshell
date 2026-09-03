@@ -5683,16 +5683,7 @@ fn wire_key_input(
                     {
                         if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
                             let mut b = h.lock().unwrap();
-                            let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, 5000);
-                            b.history.clear();
-                            b.prev.clear();
-                            b.displayed_text.clear();
-                            b.view_offset = 0;
-                            b.sel_anchor = None;
-                            b.sel_focus = None;
-                            b.sel_ranges.clear();
-                            b.raw.clear();
+                            b.release_scrollback();
                         }
                     }
                     if let Some(st) =
@@ -6152,17 +6143,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
-                let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, 5000);
-                buf.find_query.clear();
-                buf.history = VecDeque::new(); // recycle the session scrollback
-                buf.prev = Vec::new();
-                buf.view_offset = 0;
-                buf.sel_anchor = None;
-                buf.sel_focus = None;
-                buf.sel_ranges.clear();
-                buf.displayed_text = Vec::new();
-                buf.raw.clear();
+                buf.release_scrollback();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {

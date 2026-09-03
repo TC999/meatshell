@@ -190,7 +190,10 @@ export component SftpPanel inherits Rectangle {
 
                 HorizontalLayout {
                 height: 34px;
-                padding-left: 6px;
+                // Pushed the left padding from 6px to 10px so the dock drag grip
+                // sits a bit further from the panel edge and the Files tab no longer
+                // feels crowded against it (#toolbar-shadow-overlap).
+                padding-left: 10px;
                 padding-right: 6px;
                 padding-top: 6px;
                 padding-bottom: 6px;
@@ -223,6 +226,16 @@ export component SftpPanel inherits Rectangle {
                         width: parent.width;
                         height: parent.height;
                     }
+                }
+
+                // Small transparent spacer between the dock drag grip and the Files
+                // tab. Without it the grip's hover state visually bleeds into the
+                // tab's background, making the two look like a single overlapping
+                // shape (#toolbar-shadow-overlap).
+                Rectangle {
+                    width: 6px;
+                    height: 22px;
+                    background: transparent;
                 }
 
                 Rectangle {
@@ -285,6 +298,11 @@ export component SftpPanel inherits Rectangle {
                 // jump there; copy / paste-jump buttons sit right after it (#54).
                 Rectangle {
                     visible: root.panel-mode == "files" && !root.narrow-toolbar;
+                    // Floor the path field at 100px so switching to Files mode
+                    // (which reveals copy/paste/up/upload next to it) doesn't
+                    // squeeze the input down to an unreadable strip in
+                    // mid-width panels (~380–480px) (#toolbar-input-shrink).
+                    min-width: 100px;
                     horizontal-stretch: 1;
                     height: 22px;
                     border-radius: Theme.radius-sm;

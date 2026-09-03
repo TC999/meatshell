@@ -643,8 +643,14 @@ pub(super) fn wire_sftp_callbacks(
         );
     }
     {
+        // Run on a spawned thread, NOT the Slint UI thread. clipboard_set_text
+        // (arboard) can block when the OS clipboard is held by another process
+        // (Windows OpenClipboard / Wayland wait()); doing it synchronously here
+        // freezes the whole UI event loop (#sftp-copy-path-freeze). Every other
+        // caller in app.rs wraps clipboard writes in std::thread::spawn — this
+        // one was the only outlier.
         window.on_sftp_copy_path(move |path: SharedString| {
-            clipboard_set_text(path.to_string());
+            std::thread::spawn(move || clipboard_set_text(path.to_string()));
         });
     }
 
