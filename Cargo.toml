@@ -15,8 +15,8 @@ depends = "$auto"
 # 包分类和优先级
 section = "net"
 priority = "optional"
-# 需要额外安装的资产文件
 assets = [
+    ["target/release/meatshell", "usr/bin/meatshell", "755"],
     ["assets/meatshell.desktop", "usr/share/applications/", "644"],
     ["assets/icon@512.png", "usr/share/icons/hicolor/512x512/apps/meatshell.png", "644"],
     ["THIRD_PARTY_NOTICES.md", "usr/share/doc/meatshell/", "644"],
