@@ -22,8 +22,8 @@ All notable changes are documented here. 本文件记录所有重要变更。
 - **修复命令输入框全选与多行滚动（#416，输入框部分）。** `Ctrl+A` / `Cmd+A` 现在全选文本，支持滚动查看多行内容，并在选择时跟随光标。该更新不包含 `top` 无法通过 `Ctrl+C` 退出问题的修复。
 - **Fix command-input select-all and multiline scrolling (input-field portion of #416).** `Ctrl+A` / `Cmd+A` now selects all text. Multiline content can scroll, and selection keeps the cursor visible. This update does not resolve the reported inability to exit `top` with `Ctrl+C`.
 
-- **停止构建 Intel Mac 安装包。** 发布矩阵和独立测试流水线不再构建 `macos-x86_64`，后续 macOS 版本仅提供 Apple Silicon 包，以减少发布耗时和维护成本。
-- **Stop building Intel Mac packages.** Remove `macos-x86_64` from both the release matrix and the dedicated test workflow; future macOS releases provide Apple Silicon packages only, reducing CI time and maintenance cost.
+- **保留 Intel Mac 安装包。** 正式发布同时提供 Intel (`macos-x86_64`) 和 Apple Silicon (`macos-aarch64`) 安装包。
+- **Keep Intel Mac packages.** Releases provide packages for both Intel (`macos-x86_64`) and Apple Silicon (`macos-aarch64`).
 
 ## [0.7.2] - 2026-09-04
 
